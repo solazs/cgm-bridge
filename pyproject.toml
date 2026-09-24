@@ -1,0 +1,40 @@
+[project]
+name = "cgm-bridge"
+version = "0.1.0"
+description = "Receives Nightscout uploads (e.g. from Juggluco) and stores them in PostgreSQL, mirroring glucose into VictoriaMetrics"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+dependencies = [
+    "prometheus-client>=0.26.0",
+    "psycopg[binary,pool]>=3.3.6",
+]
+
+[project.scripts]
+cgm-bridge = "cgm_bridge.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+]
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, isort, bugbear, pyupgrade, bandit, simplify, ruff-specific
+select = ["F", "E", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: asserts are the point; throwaway secrets, SHA-1 of them and SQL are fixtures.
+"tests/**" = ["S101", "S105", "S106", "S324", "S608"]

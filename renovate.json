@@ -1,0 +1,52 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "schedule:weekly",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Images pinned in shell scripts (FOO_IMAGE=\"repo:tag@digest\")",
+      "managerFilePatterns": [
+        "/^scripts/.+\\.sh$/"
+      ],
+      "matchStrings": [
+        "_IMAGE=\"(?<depName>[^:\"]+):(?<currentValue>[^@\"]+)@(?<currentDigest>sha256:[a-f0-9]+)\""
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Tool versions annotated with a `# renovate:` comment on the line above",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Keep uv the same in the Dockerfile and the workflow",
+      "matchPackageNames": [
+        "ghcr.io/astral-sh/uv",
+        "astral-sh/uv"
+      ],
+      "groupName": "uv"
+    },
+    {
+      "description": "PostgreSQL major version follows the cluster's CloudNativePG instance, bumped by hand",
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    }
+  ]
+}
