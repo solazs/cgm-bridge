@@ -8,8 +8,9 @@ import hashlib
 import os
 from dataclasses import dataclass
 
-# Nightscout refuses API secrets shorter than this; keep the same floor.
-MIN_SECRET_LENGTH = 12
+# The secret (or its SHA-1) is the only credential of a public endpoint. Nightscout's floor is
+# 12; this is stricter because nobody types it by hand more than once.
+MIN_SECRET_LENGTH = 32
 
 
 class ConfigError(ValueError):
@@ -34,7 +35,7 @@ class Config:
     # Idle re-check interval of the exporter; new uploads wake it immediately.
     export_interval_seconds: float = 60.0
     # Juggluco sends at most ~10k readings (~3.6 MB) in one request.
-    max_body_bytes: int = 16 * 1024 * 1024
+    max_body_bytes: int = 8 * 1024 * 1024
     # Optional existing role that is granted SELECT on all tables (e.g. for Grafana).
     readonly_role: str = ""
 

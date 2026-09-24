@@ -1,12 +1,16 @@
 import hashlib
 import http.client
 import json
+import threading
 from urllib.parse import urlsplit
 
 import pytest
+from psycopg_pool import ConnectionPool
 
-from cgm_bridge import db
+from cgm_bridge import db, metrics
+from cgm_bridge.config import Config
 from cgm_bridge.exporter import ExportError
+from cgm_bridge.server import App, make_server
 
 from . import fixtures
 from .conftest import SECRET
@@ -66,19 +70,35 @@ def test_bad_bodies(api):
 
 def test_entries_are_stored_once(api, pool):
     status, body = request(api, "POST", "/api/v1/entries", fixtures.ENTRIES)
-    assert (status, body) == (200, {"received": 2, "inserted": 2, "skipped": 0})
+    assert (status, body) == (200, {"received": 2, "inserted": 2, "updated": 0, "skipped": 0})
     # "Resend data" in Juggluco, or a retry after a lost response.
     status, body = request(api, "POST", "/api/v1/entries", fixtures.ENTRIES)
-    assert (status, body) == (200, {"received": 2, "inserted": 0, "skipped": 0})
+    assert (status, body) == (200, {"received": 2, "inserted": 0, "updated": 0, "skipped": 0})
     assert rows(pool, "SELECT device, mg_dl, direction FROM glucose ORDER BY time") == [
         ("3MH00ABCDE", 112, "Flat"),
         ("3MH00ABCDE", 115, "FortyFiveUp"),
     ]
 
 
-def test_entries_with_c_nan(api, pool):
-    assert request(api, "POST", "/api/v1/entries", fixtures.ENTRIES_WITH_NAN)[0] == 200
-    assert rows(pool, "SELECT delta FROM glucose") == [(None,), (None,)]
+def test_undetermined_trend_stores_null_delta(api, pool):
+    assert request(api, "POST", "/api/v1/entries", fixtures.ENTRIES_UNDETERMINED)[0] == 200
+    assert rows(pool, "SELECT delta, direction FROM glucose ORDER BY time") == [
+        (None, None),
+        (1.0, "Flat"),
+    ]
+
+
+def test_corrected_resend_updates_and_reexports(api, pool, exporter, fake_vm):
+    # Juggluco calibrates at upload time: after a recalibration, "Resend data" sends new values
+    # for readings that are already stored.
+    request(api, "POST", "/api/v1/entries", fixtures.ENTRIES)
+    assert exporter.export_once() == 2
+    corrected = fixtures.ENTRIES.replace(b'"sgv":112', b'"sgv":130')
+    status, body = request(api, "POST", "/api/v1/entries", corrected)
+    assert (status, body) == (200, {"received": 2, "inserted": 0, "updated": 1, "skipped": 0})
+    assert rows(pool, "SELECT mg_dl FROM glucose ORDER BY time") == [(130,), (115,)]
+    assert exporter.export_once() == 1
+    assert json.loads(fake_vm.bodies[-1])["values"] == [130]
 
 
 # --- VictoriaMetrics export -----------------------------------------------------------------
@@ -86,7 +106,7 @@ def test_entries_with_c_nan(api, pool):
 
 def test_export_pushes_and_marks_rows(api, pool, exporter, fake_vm):
     request(api, "POST", "/api/v1/entries", fixtures.ENTRIES)
-    request(api, "POST", "/api/v1/entries", fixtures.ENTRIES_WITH_NAN)
+    request(api, "POST", "/api/v1/entries", fixtures.ENTRIES_UNDETERMINED)
 
     # batch_size=2 in the fixture: four readings take two batches, then nothing is left.
     assert [exporter.export_once() for _ in range(3)] == [2, 2, 0]
@@ -103,13 +123,17 @@ def test_export_pushes_and_marks_rows(api, pool, exporter, fake_vm):
 def test_export_failure_keeps_rows_pending(api, pool, exporter, fake_vm):
     request(api, "POST", "/api/v1/entries", fixtures.ENTRIES)
     fake_vm.status = 503
-    with pytest.raises(ExportError):
-        exporter.export_once()
+    for _ in range(3):
+        with pytest.raises(ExportError):
+            exporter.export_once()
     assert rows(pool, "SELECT count(*) FROM glucose WHERE NOT exported") == [(2,)]
+    # The "export stuck" alert watches this gauge, so it must move while exports fail.
+    assert metrics.EXPORT_PENDING._value.get() == 2
 
     fake_vm.status = 204
     assert exporter.export_once() == 2
     assert rows(pool, "SELECT count(*) FROM glucose WHERE NOT exported") == [(0,)]
+    assert metrics.EXPORT_PENDING._value.get() == 0
 
 
 def test_resent_entries_are_not_exported_twice(api, exporter, fake_vm):
@@ -150,27 +174,70 @@ def test_treatment_lifecycle(api, pool):
 # --- database -------------------------------------------------------------------------------
 
 
-def test_migrate_is_idempotent_and_grants_readonly_role(pool):
+def test_migrate_is_idempotent(pool):
+    db.migrate(pool)
+    db.migrate(pool)
+    assert rows(pool, "SELECT count(*) FROM schema_migrations") == [(len(db.MIGRATIONS),)]
+
+
+@pytest.fixture
+def reader_role(pool):
     with pool.connection() as conn:
         conn.execute("DROP ROLE IF EXISTS cgm_test_reader")
+    yield "cgm_test_reader"
+    with pool.connection() as conn:
+        conn.execute("DROP OWNED BY cgm_test_reader")
+        conn.execute("DROP ROLE cgm_test_reader")
+
+
+def test_readonly_grants_follow_the_role(pool, reader_role):
+    # Role missing (CNPG hasn't created it yet): nothing happens, no error.
+    assert db.ensure_readonly(pool, reader_role) is False
+    with pool.connection() as conn:
         conn.execute("CREATE ROLE cgm_test_reader NOLOGIN")
+    # Created later: the periodic re-grant picks it up without a restart.
+    assert db.ensure_readonly(pool, reader_role) is True
+    assert db.ensure_readonly(pool, reader_role) is True  # idempotent
+    with pool.connection() as conn:
+        conn.execute("CREATE TABLE later_table (x int)")  # a future migration's table
     try:
-        db.migrate(pool, "cgm_test_reader")
-        db.migrate(pool, "cgm_test_reader")
         assert rows(
             pool,
             "SELECT has_table_privilege('cgm_test_reader', 'glucose', 'SELECT'),"
-            " has_table_privilege('cgm_test_reader', 'glucose', 'INSERT')",
-        ) == [(True, False)]
-        assert rows(pool, "SELECT count(*) FROM schema_migrations") == [(len(db.MIGRATIONS),)]
+            " has_table_privilege('cgm_test_reader', 'glucose', 'INSERT'),"
+            " has_table_privilege('cgm_test_reader', 'later_table', 'SELECT'),"
+            " has_database_privilege('cgm_test_reader', current_database(), 'CONNECT'),"
+            " has_database_privilege('public', current_database(), 'CONNECT')",
+        ) == [(True, False, True, True, False)]
     finally:
         with pool.connection() as conn:
-            conn.execute("DROP OWNED BY cgm_test_reader")
-            conn.execute("DROP ROLE cgm_test_reader")
+            conn.execute("DROP TABLE later_table")
+            conn.execute("GRANT CONNECT ON DATABASE " + conn.info.dbname + " TO PUBLIC")
 
 
-def test_missing_readonly_role_is_not_fatal(pool):
-    db.migrate(pool, "no_such_role")
+def test_database_down_is_not_a_success(pool):
+    # Juggluco must see a non-200 so it keeps the data and retries.
+    broken = ConnectionPool("dbname=does_not_exist", min_size=0, max_size=1, timeout=1, open=True)
+    config = Config.from_secret(SECRET, listen_host="127.0.0.1", listen_port=0)
+    server = make_server(App(config, broken, None))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        assert request(base, "POST", "/api/v1/entries", fixtures.ENTRIES)[0] == 500
+        assert request(base, "GET", "/readyz", secret=None)[0] == 503
+    finally:
+        server.shutdown()
+        server.server_close()
+        broken.close()
+
+
+def test_unstorable_treatment_values_do_not_block_uploads(api, pool):
+    body = (
+        b'{"_id":"odd","date":1790000000000,"insulin":NaN,"notes":"Blood 7\\u00002",'
+        b'"extra":"\\u0000"}'
+    )
+    assert request(api, "PUT", "/api/v1/treatments", body)[0] == 200
+    assert rows(pool, "SELECT insulin, notes FROM treatments") == [(None, "Blood 72")]
 
 
 # --- HTTP plumbing --------------------------------------------------------------------------
@@ -192,7 +259,7 @@ def test_unread_body_closes_connection(api):
 def test_keep_alive_after_successful_upload(api, pool):
     parts = urlsplit(api)
     conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
-    for body in (fixtures.ENTRIES, fixtures.ENTRIES_WITH_NAN):
+    for body in (fixtures.ENTRIES, fixtures.ENTRIES_UNDETERMINED):
         conn.request("POST", "/api/v1/entries", body=body, headers={"api-secret": HASHED})
         response = conn.getresponse()
         response.read()
@@ -200,6 +267,40 @@ def test_keep_alive_after_successful_upload(api, pool):
         assert response.getheader("Connection") is None
     conn.close()
     assert rows(pool, "SELECT count(*) FROM glucose") == [(4,)]
+
+
+def test_missing_or_short_body(api):
+    parts = urlsplit(api)
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    conn.putrequest("POST", "/api/v1/entries")
+    conn.putheader("api-secret", HASHED)
+    conn.endheaders()  # no Content-Length, no body
+    response = conn.getresponse()
+    assert response.status == 411
+    conn.close()
+
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    conn.putrequest("POST", "/api/v1/entries")
+    conn.putheader("api-secret", HASHED)
+    conn.putheader("Content-Length", "100")
+    conn.endheaders()
+    conn.send(b"[]")
+    conn.sock.shutdown(1)  # client gives up after 2 of 100 bytes
+    response = conn.getresponse()
+    assert response.status == 400
+    conn.close()
+
+
+def test_malformed_chunk_size(api):
+    parts = urlsplit(api)
+    conn = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    conn.putrequest("POST", "/api/v1/entries")
+    conn.putheader("api-secret", HASHED)
+    conn.putheader("Transfer-Encoding", "chunked")
+    conn.endheaders()
+    conn.send(b"0x2\r\n[]\r\n0\r\n\r\n")
+    assert conn.getresponse().status == 400
+    conn.close()
 
 
 def test_chunked_upload(api, pool):

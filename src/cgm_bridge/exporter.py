@@ -7,6 +7,11 @@ them. A VictoriaMetrics outage never fails an upload; the export just catches up
 
 A crash between the push and the flag update re-sends that batch once. VictoriaMetrics then
 holds a duplicate sample with an identical timestamp and value, which is harmless for graphs.
+A reading corrected by a later resend is exported again under the same timestamp; without
+deduplication VictoriaMetrics keeps both values. Postgres holds the corrected one.
+
+No database connection is held during the HTTP push: select and commit, push, then flag the
+rows in a new transaction (idempotent, so a lost race only means a harmless re-send).
 """
 
 import json
@@ -97,18 +102,26 @@ class Exporter(threading.Thread):
                 "SELECT device, time, mg_dl FROM glucose WHERE NOT exported ORDER BY time LIMIT %s",
                 (self._batch_size,),
             ).fetchall()
+        try:
             if rows:
                 self._push(render_import(rows, self._metric))
-                conn.execute(
-                    "UPDATE glucose SET exported = true"
-                    " WHERE (device, time) IN"
-                    " (SELECT * FROM unnest(%s::text[], %s::timestamptz[]))",
-                    ([r[0] for r in rows], [r[1] for r in rows]),
-                )
+                with self._pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE glucose SET exported = true"
+                        " WHERE (device, time) IN"
+                        " (SELECT * FROM unnest(%s::text[], %s::timestamptz[]))",
+                        ([r[0] for r in rows], [r[1] for r in rows]),
+                    )
                 metrics.EXPORT_SAMPLES.inc(len(rows))
-            pending = conn.execute("SELECT count(*) FROM glucose WHERE NOT exported").fetchone()
-            metrics.EXPORT_PENDING.set(pending[0] if pending else 0)
+        finally:
+            # Also on failure: the "export stuck" alert watches this gauge.
+            self.update_pending()
         return len(rows)
+
+    def update_pending(self) -> None:
+        with self._pool.connection() as conn:
+            pending = conn.execute("SELECT count(*) FROM glucose WHERE NOT exported").fetchone()
+        metrics.EXPORT_PENDING.set(pending[0] if pending else 0)
 
     def _push(self, body: bytes) -> None:
         # The URL is config-validated to be http(s) (config._url), never user input.

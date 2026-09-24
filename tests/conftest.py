@@ -20,7 +20,7 @@ from cgm_bridge.config import Config
 from cgm_bridge.exporter import Exporter
 from cgm_bridge.server import App, make_server
 
-SECRET = "correct-horse-battery-staple"
+SECRET = "correct-horse-battery-staple-and-more-words"
 
 
 @pytest.fixture(scope="session")

@@ -14,14 +14,21 @@ UI, no read API, and no MongoDB.
 
 | Method | Path | Does |
 |---|---|---|
-| `POST` | `/api/v1/entries` | Store glucose readings (`type: "sgv"`). Duplicates are ignored. |
-| `POST`, `PUT` | `/api/v1/treatments` | Insert or update treatments by `_id` |
+| `POST` | `/api/v1/entries` | Store glucose readings (`type: "sgv"`). An identical resend changes nothing; a resend with corrected values (Juggluco calibrates at upload time) updates the reading. |
+| `PUT`, `POST` | `/api/v1/treatments` | Insert or update treatments by `_id` (Juggluco uses `PUT`) |
 | `DELETE` | `/api/v1/treatments/<id>` | Delete one treatment. Succeeds even if it is already gone. |
 | `GET` | `/healthz` | Liveness |
 | `GET` | `/readyz` | Readiness (database reachable) |
 
 Writes need the `api-secret` header: the SHA-1 hex of the secret, as Nightscout uploaders send
-it, or the secret itself. Bodies may be a single JSON document or an array.
+it, or the secret itself. Bodies may be a single JSON document or an array, up to 8 MB; at most
+two uploads are parsed at a time (others wait, then get 503).
+
+A document that can never be stored does not fail the request, because the uploader would
+retry it forever and send nothing after it. Unusable documents are skipped and counted, readings
+more than 15 minutes in the future (a wrong phone clock) are skipped, and `NaN` or NUL characters
+are dropped. Database error text can quote health data, so only the error class and SQLSTATE are
+logged.
 
 Every successful write answers **HTTP 200**. That matters for Juggluco, which treats any other
 code as a failure. It keeps a per-sensor "sent up to here" cursor, retries every 15 minutes, and
@@ -36,17 +43,21 @@ Prometheus metrics for the service itself (`cgm_bridge_*`) are on a separate por
 | `glucose` | `(device, time)` | mg/dL, delta, trend direction; `exported` marks rows already in VictoriaMetrics |
 | `treatments` | `id` | insulin, carbs, notes, plus `label`/`amount` parsed from Juggluco's `"<label> <value>"` notes (e.g. `Blood 7.2`), and the raw document as `jsonb` |
 
-Migrations run at startup. The VictoriaMetrics series is `cgm_glucose_mg_dl{device="<sensor>"}`
+Migrations run at startup. The read-only role's grants (`SELECT`, and `CONNECT`, which is revoked
+from `PUBLIC`) are re-applied every 5 minutes, so a role created after the service started works
+without a restart. The VictoriaMetrics series is `cgm_glucose_mg_dl{device="<sensor>"}`
 with the readings' own timestamps. Export is asynchronous: a VictoriaMetrics outage never fails
 an upload, and the export catches up afterwards. Postgres keeps everything; VictoriaMetrics only
 keeps its retention window and can be rebuilt from Postgres at any time
-(`UPDATE glucose SET exported = false`).
+(`UPDATE glucose SET exported = false`). A corrected reading is exported again under the same
+timestamp; without deduplication VictoriaMetrics then holds both values, while Postgres holds the
+corrected one.
 
 ## Configuration
 
 | Variable | Default | |
 |---|---|---|
-| `CGM_BRIDGE_API_SECRET` | — | **Required**, at least 12 characters. Use a long random one. |
+| `CGM_BRIDGE_API_SECRET` | — | **Required**, at least 32 characters. Use a random one. |
 | `PGHOST`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE`, … | | Standard libpq variables |
 | `CGM_BRIDGE_VM_URL` | empty | VictoriaMetrics base URL, e.g. `http://victoria-metrics:8428`. Empty disables export. |
 | `CGM_BRIDGE_VM_METRIC` | `cgm_glucose_mg_dl` | Metric name |

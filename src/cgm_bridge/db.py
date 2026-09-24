@@ -53,15 +53,15 @@ MIGRATIONS: list[tuple[int, str]] = [
 ]
 
 
-def migrate(pool: ConnectionPool, readonly_role: str = "") -> None:
+def migrate(pool: ConnectionPool) -> None:
     with pool.connection() as conn:
+        # Serialise concurrent starts before touching anything, including the bookkeeping table.
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext('cgm-bridge-migrate'))")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
             " version integer PRIMARY KEY,"
             " applied_at timestamptz NOT NULL DEFAULT now())"
         )
-        # Serialise concurrent starts (e.g. during a rolling update).
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext('cgm-bridge-migrate'))")
         applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
         for version, statement in MIGRATIONS:
             if version in applied:
@@ -69,34 +69,50 @@ def migrate(pool: ConnectionPool, readonly_role: str = "") -> None:
             log.info("applying migration %d", version)
             conn.execute(statement)
             conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
-        if readonly_role:
-            _grant_readonly(conn, readonly_role)
 
 
-def _grant_readonly(conn: Connection, role: str) -> None:
-    exists = conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone()
-    if not exists:
-        log.warning("read-only role %r does not exist yet; skipping grants", role)
-        return
-    ident = sql.Identifier(role)
-    conn.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(ident))
-    conn.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(ident))
-    conn.execute(
-        sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {}").format(
-            ident
+def ensure_readonly(pool: ConnectionPool, role: str) -> bool:
+    """Grants `role` read access to this database. Idempotent; returns False if the role is
+    missing. Called at startup and periodically, so a role created later (or recreated) gets
+    its grants without restarting the service."""
+    with pool.connection() as conn:
+        exists = conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone()
+        if not exists:
+            return False
+        ident = sql.Identifier(role)
+        database = sql.Identifier(conn.info.dbname)
+        # Only the owner and the read-only role may connect, not every role in the cluster.
+        conn.execute(sql.SQL("REVOKE CONNECT ON DATABASE {} FROM PUBLIC").format(database))
+        conn.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(database, ident))
+        conn.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(ident))
+        conn.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(ident))
+        conn.execute(
+            sql.SQL(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {}"
+            ).format(ident)
         )
-    )
+    return True
 
 
-def insert_glucose(conn: Connection, readings: Sequence[GlucoseReading]) -> int:
-    """Inserts readings, ignoring ones already stored. Returns how many were new."""
+def upsert_glucose(conn: Connection, readings: Sequence[GlucoseReading]) -> tuple[int, int]:
+    """Stores readings. A resend with different values (Juggluco applies calibration at upload
+    time, so a recalibrated "Resend data" changes old readings) updates the row and queues it
+    for export again; an identical resend changes nothing. Returns (inserted, updated)."""
     if not readings:
-        return 0
-    cur = conn.execute(
+        return 0, 0
+    rows = conn.execute(
         """
-        INSERT INTO glucose (device, time, mg_dl, delta, direction)
+        INSERT INTO glucose AS g (device, time, mg_dl, delta, direction)
         SELECT * FROM unnest(%s::text[], %s::timestamptz[], %s::integer[], %s::real[], %s::text[])
-        ON CONFLICT (device, time) DO NOTHING
+        ON CONFLICT (device, time) DO UPDATE SET
+            mg_dl = excluded.mg_dl,
+            delta = excluded.delta,
+            direction = excluded.direction,
+            received_at = now(),
+            exported = false
+        WHERE (g.mg_dl, g.delta, g.direction)
+            IS DISTINCT FROM (excluded.mg_dl, excluded.delta, excluded.direction)
+        RETURNING (xmax = 0) AS inserted
         """,
         (
             [r.device for r in readings],
@@ -105,8 +121,9 @@ def insert_glucose(conn: Connection, readings: Sequence[GlucoseReading]) -> int:
             [r.delta for r in readings],
             [r.direction for r in readings],
         ),
-    )
-    return cur.rowcount
+    ).fetchall()
+    inserted = sum(1 for (was_insert,) in rows if was_insert)
+    return inserted, len(rows) - inserted
 
 
 def upsert_treatments(conn: Connection, treatments: Sequence[Treatment]) -> int:

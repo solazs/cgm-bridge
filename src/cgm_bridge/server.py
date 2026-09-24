@@ -1,7 +1,8 @@
 """HTTP API: the subset of Nightscout v1 that uploaders write to.
 
     POST /api/v1/entries             glucose readings (type "sgv")
-    POST /api/v1/treatments          treatments; PUT is accepted as a synonym
+    PUT /api/v1/treatments           treatments, upserted by _id (Juggluco's v1 uploader uses
+                                     PUT; POST is accepted too)
     DELETE /api/v1/treatments/<id>   remove one treatment (Juggluco deletes, then re-posts, on edit)
     GET /healthz                     process is up
     GET /readyz                      database is reachable
@@ -14,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import threading
 import time
 from http import HTTPStatus
@@ -21,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+import psycopg
 from psycopg_pool import ConnectionPool
 
 from . import db, metrics
@@ -33,6 +36,10 @@ log = logging.getLogger(__name__)
 ENTRIES_PATHS = {"/api/v1/entries", "/api/v1/entries.json"}
 TREATMENTS_PATHS = {"/api/v1/treatments", "/api/v1/treatments.json"}
 TREATMENT_PREFIX = "/api/v1/treatments/"
+_CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,8}")
+# Uploads parsed at once. A request body costs several times its size in memory while being
+# parsed, so bound the total instead of trusting every client to send small ones.
+MAX_CONCURRENT_UPLOADS = 2
 
 
 class App:
@@ -44,6 +51,7 @@ class App:
         self.exporter = exporter
         self._latest_lock = threading.Lock()
         self._latest = 0.0
+        self.upload_slots = threading.BoundedSemaphore(MAX_CONCURRENT_UPLOADS)
 
     def note_latest(self, timestamp: float) -> None:
         with self._latest_lock:
@@ -67,15 +75,22 @@ class App:
     def store_entries(self, body: bytes) -> dict[str, int]:
         readings, skipped = parse_entries(load_json(body))
         with self.pool.connection() as conn:
-            inserted = db.insert_glucose(conn, readings)
+            inserted, updated = db.upsert_glucose(conn, readings)
+        unchanged = len(readings) - inserted - updated
         metrics.DOCUMENTS.labels("entry", "inserted").inc(inserted)
-        metrics.DOCUMENTS.labels("entry", "duplicate").inc(len(readings) - inserted)
+        metrics.DOCUMENTS.labels("entry", "updated").inc(updated)
+        metrics.DOCUMENTS.labels("entry", "duplicate").inc(unchanged)
         metrics.DOCUMENTS.labels("entry", "skipped").inc(skipped)
         if readings:
             self.note_latest(max(r.time for r in readings).timestamp())
-        if inserted and self.exporter:
+        if (inserted or updated) and self.exporter:
             self.exporter.wake()
-        return {"received": len(readings), "inserted": inserted, "skipped": skipped}
+        return {
+            "received": len(readings),
+            "inserted": inserted,
+            "updated": updated,
+            "skipped": skipped,
+        }
 
     def store_treatments(self, body: bytes) -> dict[str, int]:
         treatments, skipped = parse_treatments(load_json(body))
@@ -95,7 +110,7 @@ class App:
 
     def ready(self) -> bool:
         try:
-            with self.pool.connection(timeout=5) as conn:
+            with self.pool.connection(timeout=2) as conn:
                 conn.execute("SELECT 1")
             return True
         except Exception as exc:
@@ -138,8 +153,27 @@ class Handler(BaseHTTPRequestHandler):
             status, payload = HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "body too large"}
         except _LengthRequired:
             status, payload = HTTPStatus.LENGTH_REQUIRED, {"error": "Content-Length required"}
-        except Exception:
-            log.exception("error handling %s %s", method, route)
+        except _Busy:
+            status, payload = HTTPStatus.SERVICE_UNAVAILABLE, {"error": "busy, retry later"}
+        except psycopg.Error as exc:
+            # Database error text can quote the offending row, i.e. health data: log only the
+            # class and SQLSTATE. Juggluco gets a 500 and retries later.
+            log.error(
+                "database error handling %s %s: %s (SQLSTATE %s)",
+                method,
+                route,
+                type(exc).__name__,
+                exc.sqlstate,
+            )
+            status, payload = HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"}
+        except Exception as exc:
+            log.error(
+                "error handling %s %s: %s",
+                method,
+                route,
+                type(exc).__name__,
+                exc_info=log.isEnabledFor(logging.DEBUG),
+            )
             status, payload = HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"}
         # A body left unread would be parsed as the next request on this keep-alive
         # connection (and upstream proxies do reuse connections), so hang up instead.
@@ -179,10 +213,15 @@ class Handler(BaseHTTPRequestHandler):
         if route == "treatment":
             ident = unquote(path[len(TREATMENT_PREFIX) :])
             return route, HTTPStatus.OK, self.app.delete_treatment(ident)
-        body = self._read_body()
-        if route == "entries":
-            return route, HTTPStatus.OK, self.app.store_entries(body)
-        return route, HTTPStatus.OK, self.app.store_treatments(body)
+        if not self.app.upload_slots.acquire(timeout=30):
+            raise _Busy()
+        try:
+            body = self._read_body()
+            if route == "entries":
+                return route, HTTPStatus.OK, self.app.store_entries(body)
+            return route, HTTPStatus.OK, self.app.store_treatments(body)
+        finally:
+            self.app.upload_slots.release()
 
     # --- I/O ----------------------------------------------------------------
 
@@ -207,10 +246,11 @@ class Handler(BaseHTTPRequestHandler):
         body = bytearray()
         while True:
             line = self.rfile.readline(1024)
-            try:
-                size = int(line.split(b";", 1)[0].strip(), 16)
-            except ValueError as exc:
-                raise PayloadError("malformed chunked body") from exc
+            # Strict hex only: int(x, 16) would also accept "0x10", "1_0" or "+a".
+            size_field = line.split(b";", 1)[0].strip()
+            if not _CHUNK_SIZE.fullmatch(size_field):
+                raise PayloadError("malformed chunked body")
+            size = int(size_field, 16)
             if size == 0:
                 break
             if size < 0 or len(body) + size > limit:
@@ -242,6 +282,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         # Replaced by the structured line in _dispatch; the default logs raw paths.
         pass
+
+
+class _Busy(Exception):
+    pass
 
 
 class _BodyTooLarge(Exception):

@@ -7,7 +7,7 @@ Hand-written from the format strings in Juggluco's uploader.cpp / common.cpp (no
     treatments: {"_id":..,"date":<ms>,"eventType":"<none>","enteredBy":"Juggluco",
                  "created_at":..,<insulin | carbs | "notes":"<label> <value>">}
 
-Entries arrive as one array per sensor; a treatment arrives as a single object.
+Entries arrive as one array per sensor (POST); a treatment arrives as a single object (PUT).
 """
 
 T0 = 1_790_000_000_000  # 2026-09-21T14:13:20Z, in milliseconds
@@ -21,13 +21,14 @@ ENTRIES = (
     b'"filtered":115000,"unfiltered":115000,"rssi":100}]'
 )
 
-# printf("%.3f", NAN) and an undetermined trend ("" direction).
-ENTRIES_WITH_NAN = (
+# An undetermined trend, as Juggluco really sends it: getdelta() returns 0 for a NaN rate and
+# getdeltaname() returns "" (common.hpp / glucose.cpp), so delta 0.000 with direction "".
+ENTRIES_UNDETERMINED = (
     b'[{"type":"sgv","device":"3MH00ABCDE","dateString":"2026-09-21T16:15:20.000+0200",'
-    b'"date":1790000120000,"sgv":118,"delta":nan,"direction":"","noise":1,'
+    b'"date":1790000120000,"sgv":118,"delta":0.000,"direction":"","noise":1,'
     b'"filtered":118000,"unfiltered":118000,"rssi":100},'
     b'{"type":"sgv","device":"3MH00ABCDE","dateString":"2026-09-21T16:16:20.000+0200",'
-    b'"date":1790000180000,"sgv":119,"delta":-nan,"direction":"Flat","noise":1,'
+    b'"date":1790000180000,"sgv":119,"delta":1.000,"direction":"Flat","noise":1,'
     b'"filtered":119000,"unfiltered":119000,"rssi":100}]'
 )
 

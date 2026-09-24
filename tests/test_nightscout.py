@@ -10,9 +10,14 @@ from cgm_bridge.nightscout import PayloadError, load_json, parse_entries, parse_
 
 from . import fixtures
 
+LONG_SECRET = "a-long-enough-secret-of-32-chars-or-more"
+
+
+NOW = datetime(2026, 9, 21, 15, 0, tzinfo=UTC)
+
 
 def test_juggluco_entries():
-    readings, skipped = parse_entries(load_json(fixtures.ENTRIES))
+    readings, skipped = parse_entries(load_json(fixtures.ENTRIES), now=NOW)
     assert skipped == 0
     assert [(r.device, r.mg_dl, r.direction) for r in readings] == [
         ("3MH00ABCDE", 112, "Flat"),
@@ -22,16 +27,30 @@ def test_juggluco_entries():
     assert readings[0].delta == pytest.approx(-1.993)
 
 
-def test_c_style_nan_is_tolerated():
-    readings, skipped = parse_entries(load_json(fixtures.ENTRIES_WITH_NAN))
+def test_undetermined_trend_has_no_delta():
+    readings, skipped = parse_entries(load_json(fixtures.ENTRIES_UNDETERMINED), now=NOW)
     assert skipped == 0
-    assert [r.delta for r in readings] == [None, None]
-    assert readings[0].direction is None  # "" means undetermined
+    assert [(r.delta, r.direction) for r in readings] == [(None, None), (1.0, "Flat")]
+
+
+def test_nan_literals_and_nul_characters_are_neutralised():
+    doc = load_json(b'[{"_id":"x\\u0000y","date":1790000000000,"insulin":NaN,"notes":"a\\u0000b"}]')
+    assert doc == [{"_id": "xy", "date": 1790000000000, "insulin": None, "notes": "ab"}]
+
+
+def test_future_readings_are_skipped():
+    now = datetime(2026, 9, 21, 14, 0, tzinfo=UTC)
+    doc = [
+        {"type": "sgv", "date": fixtures.T0, "sgv": 100},  # 13 min ahead: clock skew, kept
+        {"type": "sgv", "date": fixtures.T0 + 3_600_000, "sgv": 100},  # an hour ahead
+    ]
+    readings, skipped = parse_entries(doc, now=now)
+    assert (len(readings), skipped) == (1, 1)
 
 
 def test_single_entry_object_and_date_string_fallback():
     doc = {"type": "sgv", "device": "x", "dateString": "2026-09-21T16:13:20.000+0200", "sgv": 99}
-    readings, _ = parse_entries(doc)
+    readings, _ = parse_entries(doc, now=NOW)
     assert readings[0].time == datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
 
 
@@ -48,13 +67,15 @@ def test_single_entry_object_and_date_string_fallback():
     ],
 )
 def test_unusable_entries_are_skipped(doc):
-    readings, skipped = parse_entries([doc])
+    readings, skipped = parse_entries([doc], now=NOW)
     assert (readings, skipped) == ([], 1)
 
 
 def test_invalid_json_is_rejected():
     with pytest.raises(PayloadError):
         load_json(b"[{")
+    with pytest.raises(PayloadError):
+        load_json(b'[{"sgv":nan}]')  # C printf output is not JSON, and Juggluco never sends it
     with pytest.raises(PayloadError):
         load_json(b"\xff\xfe")
     with pytest.raises(PayloadError):
@@ -117,20 +138,18 @@ def test_config():
     with pytest.raises(ConfigError):
         Config.from_env({})
     with pytest.raises(ConfigError):
-        Config.from_env({"CGM_BRIDGE_API_SECRET": "short"})
+        Config.from_env({"CGM_BRIDGE_API_SECRET": "twelve-chars-is-not-enough"})
     with pytest.raises(ConfigError):
-        Config.from_env(
-            {"CGM_BRIDGE_API_SECRET": "a-long-enough-secret", "CGM_BRIDGE_LISTEN_PORT": "x"}
-        )
+        Config.from_env({"CGM_BRIDGE_API_SECRET": LONG_SECRET, "CGM_BRIDGE_LISTEN_PORT": "x"})
     config = Config.from_env(
-        {"CGM_BRIDGE_API_SECRET": "a-long-enough-secret", "CGM_BRIDGE_VM_URL": "http://vm:8428/"}
+        {"CGM_BRIDGE_API_SECRET": LONG_SECRET, "CGM_BRIDGE_VM_URL": "http://vm:8428/"}
     )
-    assert config.api_secret_sha1 == hashlib.sha1(b"a-long-enough-secret").hexdigest()
+    assert config.api_secret_sha1 == hashlib.sha1(LONG_SECRET.encode()).hexdigest()
     assert config.vm_url == "http://vm:8428"
     with pytest.raises(ConfigError):
         Config.from_env(
             {
-                "CGM_BRIDGE_API_SECRET": "a-long-enough-secret",
+                "CGM_BRIDGE_API_SECRET": LONG_SECRET,
                 "CGM_BRIDGE_VM_URL": "file:///etc/passwd",
             }
         )

@@ -16,6 +16,25 @@ from .server import App, make_server
 
 log = logging.getLogger("cgm_bridge")
 
+GRANT_INTERVAL_SECONDS = 300
+
+
+def keep_readonly_grants(pool: ConnectionPool, role: str, stop: threading.Event) -> None:
+    """Re-applies the read-only grants every few minutes, so a role that CNPG creates (or
+    recreates) after this service started still gets access without a restart."""
+    warned = False
+    while True:
+        try:
+            if db.ensure_readonly(pool, role):
+                warned = False
+            elif not warned:
+                log.warning("read-only role %r does not exist yet; will retry", role)
+                warned = True
+        except Exception as exc:
+            log.warning("granting read access to %r failed: %s", role, type(exc).__name__)
+        if stop.wait(GRANT_INTERVAL_SECONDS):
+            return
+
 
 def main() -> int:
     logging.basicConfig(
@@ -39,7 +58,15 @@ def main() -> int:
         open=True,
     )
     pool.wait(timeout=60)
-    db.migrate(pool, config.readonly_role)
+    db.migrate(pool)
+    stop = threading.Event()
+    if config.readonly_role:
+        threading.Thread(
+            target=keep_readonly_grants,
+            args=(pool, config.readonly_role, stop),
+            name="readonly-grants",
+            daemon=True,
+        ).start()
 
     exporter = None
     if config.vm_url:
@@ -78,6 +105,7 @@ def main() -> int:
     )
     server.serve_forever()
     server.server_close()
+    stop.set()
     if exporter:
         exporter.stop()
         exporter.join(timeout=10)

@@ -2,13 +2,17 @@
 
 Written against what Juggluco actually sends (see tests/fixtures), but tolerant of other
 Nightscout uploaders: both a single document and an array of documents are accepted.
+
+A document that can never be stored must not fail the whole request: the uploader would retry
+it forever and send nothing after it. So unusable documents are skipped (and counted), and
+values PostgreSQL cannot hold (NaN/Infinity, NUL characters) are neutralised here.
 """
 
 import json
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 # Plausible sensor range with generous margins. Libre sensors report 40-500 mg/dL; anything
@@ -16,9 +20,9 @@ from typing import Any
 MIN_MG_DL = 10
 MAX_MG_DL = 1000
 
-# C's printf renders NaN/Inf as `nan`, `-nan`, `inf`, which is not JSON. Replace such bare
-# tokens in value position with null. Only used as a fallback when strict parsing fails.
-_NONFINITE = re.compile(r"(?<=[:\[,])(\s*)[-+]?(?:nan|inf(?:inity)?)(?=\s*[,}\]])", re.IGNORECASE)
+# Readings stamped further ahead than this are a wrong phone clock (or worse). Stored, one
+# would pin "newest reading" in the future and mute the stale-data alert.
+MAX_FUTURE = timedelta(minutes=15)
 
 # Juggluco sends amounts without a dedicated Nightscout field as notes "<label> <value>",
 # e.g. "Blood 7.2" for a fingerstick reading.
@@ -61,13 +65,22 @@ def load_json(body: bytes) -> Any:
     except UnicodeDecodeError as exc:
         raise PayloadError("body is not UTF-8") from exc
     try:
-        return json.loads(text)
-    except ValueError:
-        pass
-    try:
-        return json.loads(_NONFINITE.sub(r"\1null", text))
+        # NaN/Infinity literals become null: PostgreSQL's jsonb rejects them.
+        doc = json.loads(text, parse_constant=lambda _: None)
     except ValueError as exc:
         raise PayloadError(f"body is not valid JSON: {exc}") from exc
+    return _strip_nul(doc)
+
+
+def _strip_nul(value: Any) -> Any:
+    """PostgreSQL text and jsonb cannot contain U+0000; drop it wherever it appears."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    if isinstance(value, dict):
+        return {_strip_nul(k): _strip_nul(v) for k, v in value.items()}
+    return value
 
 
 def _documents(doc: Any) -> list[Any]:
@@ -110,8 +123,9 @@ def _time(doc: dict[str, Any], *keys: str) -> datetime | None:
     return None
 
 
-def parse_entries(doc: Any) -> tuple[list[GlucoseReading], int]:
+def parse_entries(doc: Any, now: datetime | None = None) -> tuple[list[GlucoseReading], int]:
     """Returns the sensor glucose readings and the number of documents skipped."""
+    latest_allowed = (now or datetime.now(UTC)) + MAX_FUTURE
     readings: list[GlucoseReading] = []
     skipped = 0
     for item in _documents(doc):
@@ -120,16 +134,23 @@ def parse_entries(doc: Any) -> tuple[list[GlucoseReading], int]:
             continue
         when = _time(item, "date", "dateString", "sysTime")
         sgv = _finite(item.get("sgv"))
-        if when is None or sgv is None or not MIN_MG_DL <= sgv <= MAX_MG_DL:
+        if (
+            when is None
+            or when > latest_allowed
+            or sgv is None
+            or not MIN_MG_DL <= sgv <= MAX_MG_DL
+        ):
             skipped += 1
             continue
+        direction = _text(item.get("direction"))
         readings.append(
             GlucoseReading(
                 device=_text(item.get("device")) or "unknown",
                 time=when,
                 mg_dl=round(sgv),
-                delta=_finite(item.get("delta")),
-                direction=_text(item.get("direction")),
+                # Juggluco sends an undetermined trend as delta 0.000 with direction "".
+                delta=_finite(item.get("delta")) if direction else None,
+                direction=direction,
             )
         )
     return readings, skipped
