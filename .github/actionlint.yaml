@@ -1,0 +1,10 @@
+# ubuntu-26.04 (the GitHub-hosted runner) went GA on 2026-09-17
+# (github.blog/changelog/2026-09-17-ubuntu-26-generally-available-and-latest-migration), but
+# actionlint v1.7.12 -- the latest release, from 2026-03-30 -- predates it and its baked-in
+# label list doesn't know about it yet, so it reports "unknown label" on every runs-on: line.
+# This isn't really a self-hosted runner; it's the only extension point actionlint offers for
+# a github-hosted label it doesn't recognize yet. Safe to delete once actionlint ships a
+# release that knows ubuntu-26.04 on its own -- check https://github.com/rhysd/actionlint/releases.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
