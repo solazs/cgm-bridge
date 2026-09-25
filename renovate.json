@@ -6,6 +6,7 @@
     "helpers:pinGitHubActionDigests",
     "docker:pinDigests"
   ],
+  "prHourlyLimit": 0,
   "customManagers": [
     {
       "customType": "regex",
@@ -42,6 +43,16 @@
       "description": "PostgreSQL major version follows the cluster's CloudNativePG instance, bumped by hand",
       "matchPackageNames": [
         "postgres"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "The GitHub-hosted runner's OS major version (runs-on: ubuntu-24.04) — a silent jump changes available apt packages and tool versions underneath every job; bump by hand after checking the runner image's changelog.",
+      "matchDepTypes": [
+        "github-runner"
       ],
       "matchUpdateTypes": [
         "major"
