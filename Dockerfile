@@ -26,6 +26,15 @@ CMD ["-v"]
 
 # --- runtime ---------------------------------------------------------------------------------
 FROM python:3.14.7-slim-trixie@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2 AS runtime
+# The base image's own system-level pip/setuptools are never used at runtime (the venv is
+# pre-built and copied in, nothing here ever installs anything) but they do count against the
+# Trivy scan — pip vendors its own copy of msgpack, and both had known HIGH CVEs with fixes
+# upstream that this image's base hadn't picked up yet. Removing them is simpler and more
+# durable than chasing that pair every time the base image lags.
+RUN rm -rf /usr/local/lib/python3.14/site-packages/pip* \
+           /usr/local/lib/python3.14/site-packages/setuptools* \
+           /usr/local/lib/python3.14/site-packages/pkg_resources* \
+    && find /usr/local/bin -maxdepth 1 -name 'pip*' -delete
 COPY --from=build /app/.venv /app/.venv
 ENV PATH=/app/.venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
